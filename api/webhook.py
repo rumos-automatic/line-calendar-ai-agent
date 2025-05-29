@@ -74,7 +74,5 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     return JSONResponse({"status": "ok"})
 
 # Vercel handler
-def handler(request, response):
-    from mangum import Mangum
-    asgi_handler = Mangum(app)
-    return asgi_handler(request, response)
+from mangum import Mangum
+handler = Mangum(app)

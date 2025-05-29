@@ -1,14 +1,21 @@
 """
-Vercel entry point
+Vercel entry point for main app
 """
-import os
-import sys
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
-# Add src to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
+app = FastAPI()
 
-from src.main import app
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return JSONResponse({
+        "service": "LINE Google Calendar Agent",
+        "version": "1.0.0",
+        "environment": "vercel",
+        "status": "healthy"
+    })
 
-# Vercel expects handler function
-def handler(request, response):
-    return app(request, response)
+# For Vercel
+from mangum import Mangum
+handler = Mangum(app)

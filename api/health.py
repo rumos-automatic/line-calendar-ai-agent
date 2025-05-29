@@ -18,7 +18,5 @@ async def health_check():
     return JSONResponse({"status": "healthy", "runtime": "vercel"})
 
 # Vercel handler
-def handler(request, response):
-    from mangum import Mangum
-    asgi_handler = Mangum(app)
-    return asgi_handler(request, response)
+from mangum import Mangum
+handler = Mangum(app)

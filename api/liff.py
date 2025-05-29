@@ -95,7 +95,5 @@ async def get_user_settings(line_user_id: str = Query(...)):
     }
 
 # Vercel handler
-def handler(request, response):
-    from mangum import Mangum
-    asgi_handler = Mangum(app)
-    return asgi_handler(request, response)
+from mangum import Mangum
+handler = Mangum(app)
