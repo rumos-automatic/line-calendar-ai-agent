@@ -1,0 +1,607 @@
+# LINE連携 最新実装ガイド
+**GoogleカレンダーLINE連携プロジェクト向け**
+
+*2025年4月7日作成*
+
+## 目次
+1. [LINE Messaging API 最新情報](#1-line-messaging-api-最新情報)
+2. [LINE LIFF 最新情報](#2-line-liff-最新情報)
+3. [LINE Bot SDK v3への移行](#3-line-bot-sdk-v3への移行)
+4. [実装上の注意点と対応策](#4-実装上の注意点と対応策)
+5. [サンプルコード](#5-サンプルコード)
+6. [テスト・デバッグ](#6-テストデバッグ)
+7. [参考リソース](#7-参考リソース)
+
+---
+
+## 1. LINE Messaging API 最新情報
+
+### 1.1 重要な変更点
+
+#### チャネル作成フローの変更
+**重要**: 2024年9月4日以降、LINE DevelopersコンソールからMessaging APIチャネルを直接作成できなくなりました。
+
+新しいチャネル作成フロー:
+1. [LINE公式アカウントマネージャー](https://manager.line.biz/)で公式アカウントを作成
+2. 「設定」>「Messaging API」から連携設定を行う
+3. LINE Developersコンソールで連携を完了する
+
+#### Messaging API機能強化
+- リッチメニューのエイリアス機能の追加 (複数のリッチメニューを切り替えやすく)
+- ブロードキャストメッセージの強化 (より細かいセグメント配信が可能)
+- Webhook機能の拡張 (より多くのイベントを受け取り可能)
+
+#### レート制限の変更
+- メッセージ送信: 標準プランで1分あたり最大60回 (月間上限は変更なし)
+- Webhook送信: 1秒あたり最大10イベント (制限緩和)
+
+### 1.2 推奨される実装パターン
+
+#### Webhookハンドリングのベストプラクティス (Cloud Run + FastAPI)
+```python
+# 非同期処理とバックグラウンドタスクを活用したWebhookハンドリング
+from fastapi import BackgroundTasks # FastAPIのBackgroundTasksをインポート
+
+@router.post("/webhook")
+async def handle_webhook(request: Request, background_tasks: BackgroundTasks, db = Depends(get_db)): # BackgroundTasksを追加
+    signature = request.headers.get('X-Line-Signature', '')
+    body = await request.body()
+    body_str = body.decode('utf-8')
+
+    # Cloud Loggingへのログ出力推奨 (リクエスト情報など)
+    logging.info("Webhook received", extra={"json_fields": {"signature_present": bool(signature), "body_length": len(body_str)}})
+
+    try:
+        # 署名検証
+        events = await parser.parse(body_str, signature) # SDK v3 は非同期対応
+
+        # 各イベント処理をバックグラウンドタスクとして登録 (応答時間を短縮)
+        for event in events:
+            background_tasks.add_task(process_event, event, db) # process_eventをバックグラウンドで実行
+
+        return {"status": "ok"} # すぐに応答を返す
+    except InvalidSignatureError:
+        logging.warning("Invalid signature received")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    except Exception as e: # より広範なエラーをキャッチ
+        logging.error(f"Error processing webhook: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error processing webhook")
+
+async def process_event(event, db):
+    # 各種イベント処理を非同期で行う
+    try:
+        if isinstance(event, MessageEvent):
+            await handle_message(event, db)
+        elif isinstance(event, FollowEvent):
+            await handle_follow(event, db)
+        # 他のイベントも同様に処理
+        logging.info(f"Processed event type: {type(event).__name__}", extra={"json_fields": {"source_user_id": event.source.user_id if hasattr(event.source, 'user_id') else None}})
+    except Exception as e:
+        # バックグラウンドタスクでのエラーもログに記録
+        logging.error(f"Error in background event processing: {e}", exc_info=True, extra={"json_fields": {"event_type": type(event).__name__}})
+
+```
+*注意: `process_event` 内でのエラーはクライアントには直接返されませんが、Cloud Loggingで監視することが重要です。*
+
+#### メッセージ送信の最適化
+- バッチ送信を活用してAPI呼び出し回数を削減
+- 重要なメッセージは確実性の高い方法で送信（リトライロジック実装）
+- 配信状況の監視とエラーハンドリングの強化
+
+---
+
+## 2. LINE LIFF 最新情報
+
+### 2.1 最新アップデート
+
+#### URL処理の変更 (RFC 3986準拠)
+- 一部文字のパーセントエンコーディング処理の変更
+- 特に注意が必要な文字: `~!@#$&*()=:/,;?+'`
+- 変更例: スペース文字は従来「+」でエンコードされていたが、「%20」に変更
+
+#### LIFF CLI v0.2.0の機能
+- ローカル開発サーバーをHTTPSで起動可能 (`serve` コマンド)
+- LIFF Inspectorとの連携による効率的なデバッグ
+- 基本コマンド:
+  ```bash
+  # インストール
+  npm install -g @line/liff-cli
+  
+  # HTTPS開発サーバー起動
+  liff serve --https
+  ```
+
+#### ヘッダーデザインの変更
+- LINEミニアプリのヘッダーUIが刷新
+- ヘッダーオプションでカスタマイズ可能に (色、ロゴ位置など)
+- LINE Developersコンソール > LINEミニアプリチャネル > 「ヘッダー設定」で管理
+
+### 2.2 セキュリティ強化
+
+#### LIFF Browserの改善
+- よりネイティブに近い体験を提供
+- セキュアなCookieとLocalStorageの分離
+- サードパーティCookieへの対応強化
+
+#### OAuth認証フローの改善
+- PKCE (Proof Key for Code Exchange)サポートの強化
+- ステートパラメータの自動検証
+- スコープ要求の透明化
+
+### 2.3 LIFFアプリの最適化
+
+#### パフォーマンス向上のポイント
+- Lazy Loading対応 (特に画像やスクリプト)
+- Service Workerの活用
+- キャッシュ戦略の最適化
+
+#### オフライン対応
+- オフライン状態での基本機能動作
+- 再接続時の自動同期機能
+- オフライン通知の実装
+
+---
+
+## 3. LINE Bot SDK v3への移行
+
+### 3.1 主な変更点
+
+#### 非同期処理サポート
+- v3ではasync/awaitをネイティブサポート
+- Webhookハンドラーが非同期処理をサポート
+- メッセージ送信も非同期で実行可能
+
+```python
+# v2 (旧)
+line_bot_api.reply_message(event.reply_token, messages)
+
+# v3 (新)
+await line_bot_api.reply_message(event.reply_token, messages)
+```
+
+#### 型ヒントの改善
+- すべてのクラスとメソッドに型ヒントが追加
+- 開発時の補完機能が強化
+- mypy等の型チェッカーと連携可能
+
+#### エラーハンドリングの強化
+- より詳細なエラー情報
+- 構造化されたエラーレスポンス
+- エラーカテゴリの明確化
+
+#### 依存パッケージの変更
+- 内部依存関係の更新
+- より効率的なHTTPクライアントの採用
+- 外部ライブラリへの依存を最小化
+
+### 3.2 移行手順
+
+#### 環境準備
+```bash
+# requirements.txtの更新
+pip uninstall line-bot-sdk
+pip install line-bot-sdk>=3.0.0
+```
+
+#### コード更新のポイント
+
+1. **インポート文の変更**
+   ```python
+   # 一部のモジュール名やクラス名が変更
+   # 詳細な変更点はAPI移行ガイドを参照
+   ```
+
+2. **非同期処理への対応**
+   ```python
+   # FastAPIなどの非同期フレームワークでの実装例
+   @router.post("/webhook")
+   async def handle_webhook(request: Request):
+       # 非同期処理を実装
+       body = await request.body()
+       # ...
+   ```
+
+3. **オブジェクトモデルの変更**
+   ```python
+   # 一部のオブジェクト構造が変更
+   # 特にWebhookイベントモデルの構造確認が必要
+   ```
+
+4. **エラーハンドリングの更新**
+   ```python
+   try:
+       await line_bot_api.reply_message(...)
+   except LineAPIError as e:
+       # 構造化されたエラー情報へのアクセス
+       error_detail = e.error
+       error_message = e.message
+       # ...
+   ```
+
+5. **テスト済みコードのリファクタリング**
+   - 各機能ごとに段階的に更新
+   - 単体テストで機能確認
+   - 統合テストで全体の動作確認
+
+---
+
+## 4. 実装上の注意点と対応策
+
+### 4.1 共通の注意点
+
+#### セキュリティ対策 (GCP連携)
+- Messaging APIのChannelSecret/AccessTokenは **GCP Secret Manager** で安全に管理し、Cloud Runサービスアカウントに必要な権限を付与して実行時に取得する。
+- Webhookリクエストの署名検証 (`X-Line-Signature`) を必ず行う。
+- LIFF URLは推測されにくいものにし、必要に応じてアクセス制御を検討する。
+- ユーザー認証情報（Googleリフレッシュトークン等）は **Secret Manager の鍵で暗号化** し、Firestoreに保存する。
+
+#### パフォーマンス最適化
+- バッチ処理を活用したAPI呼び出し削減
+- キャッシュ戦略の適用
+- レスポンスサイズの最適化
+
+#### エラーハンドリング
+- 一時的なネットワークエラーへの対応
+- APIレート制限への対処
+- ユーザーフレンドリーなエラーメッセージ
+
+### 4.2 GoogleカレンダーとLINE連携特有の課題
+
+#### ユーザー認証の連携 (PKCE + Firestore + Secret Manager)
+- LINE IDとGoogleアカウントの紐付けは、**PKCE** を利用したOAuth 2.0フローで行う。
+- Googleリフレッシュトークンは **Secret Manager の鍵で暗号化** してFirestoreに保存する。
+- トークンリフレッシュは **Cloud Scheduler/Tasks** を利用した定期的なバッチ処理、またはAPI呼び出し前のオンデマンドチェックで行う。(`GoogleカレンダーAPI実装ガイド.txt` 参照)
+
+#### データ同期戦略
+- カレンダーデータのキャッシュと同期
+- 部分更新による効率化
+- 差分更新の活用
+
+#### マルチデバイス対応
+- 異なるデバイスからのアクセス対応
+- 同期状態の維持
+- デバイス固有の機能最適化
+
+---
+
+## 5. サンプルコード
+
+### 5.1 LINE Bot SDK v3によるWebhook実装 (FastAPI + BackgroundTasks + 初期NLP)
+
+```python
+# src/controllers/line_controller.py の更新例
+from fastapi import APIRouter, Request, Depends, HTTPException, BackgroundTasks
+from linebot.v3 import WebhookParser
+from linebot.v3.exceptions import InvalidSignatureError
+from linebot.v3.webhooks import (
+    MessageEvent, TextMessageContent, FollowEvent, UnfollowEvent
+)
+from linebot.v3.messaging import (
+    AsyncApiClient, AsyncMessagingApi, TextMessage, ReplyMessageRequest
+)
+import logging # ロギングをインポート
+
+# 設定、DB、サービス、NLPエンジンをインポート
+from ..core.config import settings # Secret Managerから読み込む設定
+from ..models.database import get_db # DBセッション取得 (非同期対応が必要な場合あり)
+from ..services.line_service import handle_follow, handle_unfollow # フォロー/アンフォロー処理
+from ..nlp.parser import parse_intent_and_entities # パターン認識ベースのNLPエンジン (仮)
+from ..services.message_handler import process_parsed_message # 解析結果に基づく処理 (仮)
+
+# LINE SDK初期化 (設定はSecret Managerから取得)
+# 注意: settings.LINE_CHANNEL_ACCESS_TOKEN や settings.LINE_CHANNEL_SECRET は
+# Secret Managerから取得する実装になっている想定
+configuration = {"host": "https://api.line.me", "access_token": settings.LINE_CHANNEL_ACCESS_TOKEN}
+line_bot_api = AsyncMessagingApi(AsyncApiClient(configuration=configuration))
+parser = WebhookParser(settings.LINE_CHANNEL_SECRET)
+
+router = APIRouter()
+
+@router.post("/webhook")
+async def handle_webhook(request: Request, background_tasks: BackgroundTasks, db = Depends(get_db)):
+    signature = request.headers.get('X-Line-Signature', '')
+    body = await request.body()
+    body_str = body.decode('utf-8')
+
+    logging.info("Webhook received", extra={"json_fields": {"signature_present": bool(signature), "body_length": len(body_str)}})
+
+    try:
+        events = await parser.parse(body_str, signature)
+        for event in events:
+            # イベント処理をバックグラウンドタスクに登録
+            background_tasks.add_task(process_event, event, db)
+        return {"status": "ok"}
+    except InvalidSignatureError:
+        logging.warning("Invalid signature received")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    except Exception as e:
+        logging.error(f"Error parsing webhook: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error parsing webhook")
+
+async def process_event(event, db):
+    """個別のイベントを処理するバックグラウンドタスク"""
+    line_user_id = event.source.user_id if hasattr(event.source, 'user_id') else None
+    try:
+        if isinstance(event, MessageEvent) and isinstance(event.message, TextMessageContent):
+            await handle_text_message(event, db)
+        elif isinstance(event, FollowEvent):
+            await handle_follow(event, db) # フォローイベント処理
+        elif isinstance(event, UnfollowEvent):
+            await handle_unfollow(event, db) # アンフォローイベント処理
+        # 他のイベントタイプ (PostbackEventなど) の処理もここに追加
+        logging.info(f"Processed event type: {type(event).__name__}", extra={"json_fields": {"source_user_id": line_user_id}})
+    except Exception as e:
+        logging.error(f"Error in background event processing: {e}", exc_info=True, extra={"json_fields": {"event_type": type(event).__name__, "source_user_id": line_user_id}})
+        # 必要であれば、失敗したことを示す情報をDBに記録するなどのフォールバック処理
+
+async def handle_text_message(event: MessageEvent, db):
+    """テキストメッセージを処理"""
+    line_user_id = event.source.user_id
+    text = event.message.text
+    reply_token = event.reply_token
+
+    try:
+        # 1. パターン認識エンジンで解析
+        parsed_result = parse_intent_and_entities(text) # 同期/非同期は実装による
+
+        # 2. 解析結果に基づいて応答を生成・実行
+        #    (Googleカレンダー連携、DB操作などを含む)
+        reply_messages_content = await process_parsed_message(line_user_id, parsed_result, db)
+
+        # 3. 応答メッセージを送信
+        if reply_messages_content:
+            messages = [TextMessage(text=content) for content in reply_messages_content]
+            await line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=messages
+                )
+            )
+        else:
+            # 応答不要な場合や、Push Messageで別途通知する場合など
+            logging.info("No reply message generated.", extra={"json_fields": {"user_id": line_user_id, "text": text}})
+
+    except Exception as e:
+        logging.error(f"Error processing text message for {line_user_id}: {e}", exc_info=True)
+        try:
+            # ユーザーに汎用エラーメッセージを送信
+            await line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=reply_token,
+                    messages=[TextMessage(text="申し訳ありません。処理中にエラーが発生しました。")]
+                )
+            )
+        except Exception as reply_e:
+            logging.error(f"Failed to send error reply to {line_user_id}: {reply_e}", exc_info=True)
+
+```
+*注意: 上記は初期リリース（パターン認識ベースNLP）を想定した例です。リリース後にOpenAI Agents SDKを導入する場合は、`parse_intent_and_entities` や `process_parsed_message` の部分が Agents SDK を呼び出す処理に置き換わります。*
+
+### 5.2 LIFF連携の実装例 (PKCE連携考慮)
+
+```javascript
+// src/static/js/liff-init.js (主要部分)
+
+document.addEventListener('DOMContentLoaded', async () => {
+  const liffId = settings.LIFF_ID; // 設定から取得推奨
+  if (!liffId) {
+    showError("LIFF IDが設定されていません。");
+    return;
+  }
+
+  try {
+    await liff.init({ liffId: liffId });
+    console.log("LIFF initialized");
+
+    if (!liff.isLoggedIn()) {
+      console.log("Not logged in to LINE. Redirecting to login...");
+      // ログインページにリダイレクト、ログイン後のリダイレクト先を指定
+      liff.login({ redirectUri: window.location.href });
+      return;
+    }
+
+    // プロフィール取得
+    const profile = await liff.getProfile();
+    const lineUserId = profile.userId;
+    displayUserProfile(profile); // ユーザー情報を表示する関数 (仮)
+
+    // バックエンドに連携状態を確認
+    const authStatus = await checkBackendAuthStatus(lineUserId); // バックエンドAPI呼び出し (仮)
+
+    if (authStatus.isGoogleLinked) {
+      showSettingsScreen(authStatus.settings); // 設定画面表示 (仮)
+      document.getElementById('google-link-button').style.display = 'none';
+      document.getElementById('google-unlink-button').style.display = 'block'; // 連携解除ボタン表示
+    } else {
+      showLinkScreen(); // 連携促進画面表示 (仮)
+      document.getElementById('google-link-button').style.display = 'block';
+      document.getElementById('google-unlink-button').style.display = 'none';
+    }
+
+    // ボタンイベントリスナー設定
+    setupButtons(lineUserId);
+
+  } catch (err) {
+    console.error("LIFF Error:", err);
+    showError(`LIFF処理中にエラーが発生しました: ${err.message}`);
+  }
+});
+
+// バックエンドに認証状態を確認する関数 (仮)
+async function checkBackendAuthStatus(lineUserId) {
+  try {
+    const response = await fetch(`/liff/status?userId=${lineUserId}`); // バックエンドAPI (仮)
+    if (!response.ok) {
+      throw new Error(`API Error: ${response.statusText}`);
+    }
+    return await response.json();
+  } catch (err) {
+    console.error("Failed to check auth status:", err);
+    showError("連携状態の確認に失敗しました。");
+    return { isGoogleLinked: false }; // デフォルトは未連携扱い
+  }
+}
+
+// ボタンイベントリスナー設定
+function setupButtons(lineUserId) {
+  const linkButton = document.getElementById('google-link-button');
+  if (linkButton) {
+    linkButton.addEventListener('click', () => {
+      // バックエンドのGoogle認証開始エンドポイントへリダイレクト
+      // バックエンド側でPKCEフローを開始し、認証URLを返す
+      window.location.href = `/liff/auth/google?userId=${lineUserId}`; // バックエンドがstate等も付与してリダイレクト
+    });
+  }
+  // 連携解除ボタンなどのリスナーも設定
+}
+
+// エラー表示関数 (仮)
+function showError(message) {
+  const errorElement = document.getElementById('error-message');
+  if (errorElement) {
+    errorElement.textContent = message;
+    errorElement.style.display = 'block';
+  }
+}
+
+// 他のUI表示関数 (displayUserProfile, showSettingsScreen, showLinkScreen など)
+// ...
+```
+
+### 5.3 Google認証コールバック処理 (PKCE + Firestore + Secret Manager)
+
+```python
+# src/controllers/liff_controller.py または auth_controller.py のコールバック処理更新
+from fastapi import APIRouter, Request, Depends, HTTPException, responses
+from ..models.database import get_db # DB依存関係
+from ..services.auth_service import ( # 認証サービス (仮)
+    create_oauth_flow,
+    exchange_code_for_token_with_pkce,
+    save_google_credentials,
+    verify_state_and_get_user_id # state検証とユーザーID取得関数 (仮)
+)
+import logging
+
+router = APIRouter()
+
+@router.get("/auth/google/callback")
+async def google_callback(request: Request, code: str | None = None, error: str | None = None, state: str | None = None, db = Depends(get_db)):
+    """Google認証コールバック処理 (PKCE対応)"""
+    if error:
+        logging.error(f"Google Auth Error: {error}", extra={"json_fields": {"state": state}})
+        # エラー情報をLIFFに伝えるリダイレクト
+        return responses.RedirectResponse(url=f"/liff?auth=error&reason={error}")
+    if not code or not state:
+        logging.warning("Google Auth Callback missing code or state")
+        return responses.RedirectResponse(url="/liff?auth=error&reason=missing_params")
+
+    try:
+        # 1. stateを検証し、関連するユーザーIDとcode_verifierを取得
+        #    (この関数内で一時保存データの取得・削除も行う想定)
+        line_user_id, code_verifier = await verify_state_and_get_user_id(state)
+        if not line_user_id or not code_verifier:
+            raise ValueError("Invalid or expired state/code_verifier")
+
+        # 2. OAuthフローを作成し、トークンを交換 (PKCE)
+        flow = create_oauth_flow()
+        # exchange_code_for_token_with_pkce は内部で fetch_token(code=code, code_verifier=code_verifier) を実行する想定
+        credentials = await exchange_code_for_token_with_pkce(flow, code, code_verifier)
+
+        # 3. 認証情報を安全に保存 (暗号化してFirestoreへ)
+        await save_google_credentials(line_user_id, credentials)
+
+        logging.info(f"Google account linked successfully for user {line_user_id}")
+        # 成功をLIFFに伝えるリダイレクト
+        return responses.RedirectResponse(url="/liff?auth=success")
+
+    except ValueError as ve: # stateやverifierの検証エラー
+        logging.warning(f"Google Auth State/Verifier Error: {ve}", extra={"json_fields": {"state": state}})
+        return responses.RedirectResponse(url="/liff?auth=error&reason=invalid_state")
+    except Exception as e:
+        logging.error(f"Google Auth Callback Error: {e}", exc_info=True, extra={"json_fields": {"state": state}})
+        # 汎用エラーをLIFFに伝えるリダイレクト
+        return responses.RedirectResponse(url="/liff?auth=error&reason=internal_error")
+
+```
+*注意: 上記はFastAPIでの例です。`verify_state_and_get_user_id`, `exchange_code_for_token_with_pkce`, `save_google_credentials` は別途実装が必要です。リダイレクト先 (`/liff?auth=...`) はLIFFアプリ側で適切に処理する必要があります。*
+
+---
+
+## 6. テスト・デバッグ
+
+### 6.1 開発環境のセットアップ (GCP連携考慮)
+
+#### LINEアプリテスト環境
+- LINE Bot Developerをテスト用に登録
+- テスト用LINEグループを作成
+- LINE公式アカウント マネージャーでのテスト配信設定
+
+#### ローカル開発環境 (Docker + エミュレータ)
+- **Docker Compose:** FastAPI(Cloud Run相当)、Firestoreエミュレータ、(必要なら)Secret Managerエミュレータ等をコンテナで起動し、ローカル環境をGCP環境に近づける。
+- **Firestoreエミュレータ:** ローカルでのFirestoreテストに使用。
+- **ngrok:** ローカルのWebhookエンドポイントを一時的に公開し、LINE Platformからのリクエストを受け取るために使用。
+  ```bash
+  # Docker Composeでアプリ起動後
+  ngrok http 8000 # FastAPIが動作するポートを指定
+  ```
+- **LIFF開発:** LIFF CLI や Vite/React/Vue等のフロントエンド開発サーバーを使用。バックエンドAPIのエンドポイントはローカルDockerコンテナまたはngrok経由のアドレスを指定。
+
+#### ステージング環境 (GCP)
+- 本番環境とは別のGCPプロジェクト、またはCloud Runの別サービスとして構築。
+- CI/CDパイプラインから自動デプロイされる。
+- 本番に近い設定（Secret Manager利用など）で動作検証を行う。
+
+### 6.2 デバッグテクニック
+
+#### Webhook検証
+- [LINE公式のWebhook Tester](https://developers.line.biz/console/fx/)の活用。
+- **Cloud Logging:** Cloud RunにデプロイされたサービスのWebhookエンドポイントへのリクエストログ、処理ログ、エラーログを確認する。構造化ログにより、特定のユーザーやリクエストの追跡が容易。
+- ngrok利用時のローカルデバッグ: ngrokのWebインターフェース (`http://localhost:4040`) でリクエスト/レスポンスを確認。
+
+#### LIFF Inspector & ブラウザ開発ツール
+- LIFFアプリのデバッグにはLIFF Inspectorやブラウザの開発ツール（コンソールログ、ネットワークタブ、ストレージ確認）が不可欠。
+- 特に認証フローやバックエンドAPI呼び出しのエラーを確認する際に重要。
+
+### 6.3 一般的なデバッグ手順
+
+1. **Webhookの疎通確認**
+   - LINE Developersコンソールでの接続テスト
+   - エラーレスポンスのチェック
+
+2. **メッセージングの動作検証**
+   - テストアカウントでの送受信
+   - 各メッセージタイプでの動作確認
+
+3. **LIFF機能の検証**
+   - 認証フローの確認
+   - デバイス別動作の検証
+   - 画面遷移の確認
+
+4. **エラー状況の再現と修正**
+   - エラーログの詳細分析
+   - 再現手順の明確化
+   - 修正と再テスト
+
+---
+
+## 7. 参考リソース
+
+### 公式ドキュメント
+- [LINE Messaging API リファレンス](https://developers.line.biz/ja/reference/messaging-api/)
+- [LINE Bot SDK for Python v3](https://github.com/line/line-bot-sdk-python)
+- [LINE LIFF ドキュメント](https://developers.line.biz/ja/docs/liff/)
+- [LINE Developers ニュース](https://developers.line.biz/ja/news/)
+
+### チュートリアルとサンプル
+- [LINE Bot開発入門](https://developers.line.biz/ja/docs/messaging-api/building-bot/)
+- [LIFF v2ドキュメント](https://developers.line.biz/ja/docs/liff/developing-liff-apps/)
+- [LINE Login v2.1実装ガイド](https://developers.line.biz/ja/docs/line-login/integrate-line-login/)
+
+### コミュニティリソース
+- [LINE Developers Community](https://community.line.me/ja/questions)
+- [GitHub - line/line-bot-sdk-python](https://github.com/line/line-bot-sdk-python)
+- [GitHub - line/line-liff-starter](https://github.com/line/line-liff-starter)
+
+### 移行ガイド
+- [LINE Bot SDK v3移行ガイド](https://github.com/line/line-bot-sdk-python/blob/master/docs/migration-guide.md)
+- [LIFF v2移行ガイド](https://developers.line.biz/ja/docs/liff/migration-guide/)

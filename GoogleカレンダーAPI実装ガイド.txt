@@ -1,0 +1,1001 @@
+# GoogleカレンダーAPI実装ガイド
+**LINEボット連携プロジェクト向け**
+
+*2025年4月7日作成*
+
+## 目次
+1. [概要](#1-概要)
+2. [API設定とプロジェクト準備](#2-api設定とプロジェクト準備)
+3. [認証と権限](#3-認証と権限)
+4. [イベント操作](#4-イベント操作)
+5. [リフレッシュトークン管理](#5-リフレッシュトークン管理)
+6. [制限とベストプラクティス](#6-制限とベストプラクティス)
+7. [エラー処理とトラブルシューティング](#7-エラー処理とトラブルシューティング)
+8. [実装例](#8-実装例)
+9. [参考リソース](#9-参考リソース)
+
+---
+
+## 1. 概要
+
+GoogleカレンダーAPIは、Googleカレンダーのデータを操作するための強力なRESTful APIです。このガイドでは、LINEボットと連携したGoogleカレンダーの管理に必要な実装方法を説明します。
+
+### 1.1 APIバージョン
+
+2025年現在、最新のAPIバージョンは **Google Calendar API v3** です。このバージョンは安定しており、本プロジェクトでの使用を推奨します。
+
+### 1.2 主な機能
+
+- カレンダーの作成・取得・更新・削除
+- イベントの作成・取得・更新・削除
+- 予定の通知設定
+- 空き時間の検索
+- アクセス権限の管理
+
+### 1.3 APIの利用シナリオ
+
+本プロジェクトでは、主に以下のシナリオでAPIを利用します：
+
+1. ユーザーがLINEで予定を追加 → GoogleカレンダーAPIで予定を作成
+2. ユーザーがLINEで予定を確認 → GoogleカレンダーAPIで予定を取得
+3. ユーザーがLINEで予定を編集/削除 → GoogleカレンダーAPIで予定を更新/削除
+4. 定期的なリマインド通知 → GoogleカレンダーAPIで直近の予定を取得してLINEに通知
+
+---
+
+## 2. API設定とプロジェクト準備
+
+### 2.1 Googleプロジェクト作成
+
+1. [Google Cloud Console](https://console.cloud.google.com/) にアクセス
+2. 新しいプロジェクトを作成（「LINE Calendar Bot」など）
+3. 左側のメニューから「APIとサービス」>「ライブラリ」を選択
+4. 「Google Calendar API」を検索して有効化
+
+### 2.2 認証情報の作成
+
+1. 「APIとサービス」>「認証情報」を選択
+2. 「認証情報を作成」>「OAuthクライアントID」を選択
+3. アプリケーションタイプで「ウェブアプリケーション」を選択
+4. 名前を入力（例：「LINE Calendar Bot」）
+5. 承認済みのリダイレクトURIに、あなたのアプリケーションのコールバックURLを追加
+   ```
+   https://あなたのドメイン/auth/google/callback
+   ```
+6. 「作成」をクリックしてクライアントIDとシークレットを取得
+
+### 2.3 OAuth同意画面の設定
+
+1. 「APIとサービス」>「OAuth同意画面」を選択
+2. ユーザータイプ（外部または内部）を選択
+3. アプリ名、メールアドレス、権限スコープなどの必要情報を入力
+4. テスト用ユーザーを追加（開発時は自分のメールアドレスを追加）
+
+### 2.4 Pythonライブラリのインストール
+
+```bash
+pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib
+```
+
+### 2.5 認証情報の安全な管理 (GCP Secret Manager)
+
+Google Client ID, Client Secret などの機密情報は、ソースコードや環境変数に直接記述せず、**GCP Secret Manager** を使用して安全に管理します。
+
+1.  **Secret Manager にシークレットを作成:**
+    *   `google-client-id`
+    *   `google-client-secret`
+    *   `google-redirect-uri` (必要に応じて)
+    *   `google-refresh-token-encryption-key` (リフレッシュトークン暗号化用)
+2.  **Cloud Run サービスアカウントに権限付与:**
+    *   Secret Manager シークレットアクセサー (`roles/secretmanager.secretAccessor`) のIAMロールを付与します。
+3.  **アプリケーションからの読み込み:**
+    *   アプリケーション起動時または必要に応じて、Google Cloud Client Libraries を使用して Secret Manager から値を取得します。
+
+```python
+# core/config.py (例)
+from google.cloud import secretmanager
+import os
+
+def get_secret(secret_id, project_id=os.getenv("GOOGLE_CLOUD_PROJECT")):
+    """Secret Managerからシークレットを取得"""
+    client = secretmanager.SecretManagerServiceClient()
+    name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
+    response = client.access_secret_version(request={"name": name})
+    return response.payload.data.decode("UTF-8")
+
+class Settings:
+    GOOGLE_CLIENT_ID: str = get_secret("google-client-id")
+    GOOGLE_CLIENT_SECRET: str = get_secret("google-client-secret")
+    GOOGLE_REDIRECT_URI: str = get_secret("google-redirect-uri")
+    # ... 他の設定値
+```
+*注意: 上記は同期的な取得例です。非同期フレームワーク (FastAPI) では非同期クライアントライブラリの使用や、起動時の同期処理を検討してください。*
+
+---
+
+## 3. 認証と権限
+
+### 3.1 必要なスコープ
+
+GoogleカレンダーAPIへのアクセスには、適切なスコープが必要です。本プロジェクトでは以下のスコープを使用します：
+
+- `https://www.googleapis.com/auth/calendar` - カレンダーの完全なアクセス権（読み取り/書き込み）
+- `https://www.googleapis.com/auth/calendar.events` - カレンダーイベントの読み取り/書き込み
+- `https://www.googleapis.com/auth/calendar.readonly` - カレンダーの読み取り専用（必要に応じて）
+
+**注意**: 最小権限の原則に従い、必要最小限のスコープのみを要求することを推奨します。
+
+### 3.2 OAuth 2.0認証フロー (PKCE推奨)
+
+セキュリティ強化のため、**PKCE (Proof Key for Code Exchange)** を利用した認可コードフローを推奨します。
+
+#### 3.2.1 フロー概要 (PKCE利用)
+
+1.  ユーザーがLINE LIFF画面で「Googleアカウントと連携」をクリック。
+2.  **バックエンド:** PKCE用の `code_verifier` と `code_challenge` を生成。`code_verifier` を一時保存（stateと紐付け）。
+3.  バックエンドがGoogle認証URLを生成（`code_challenge` と `code_challenge_method=S256` を含む）。
+4.  ユーザーがGoogle認証を行い、アクセス権を付与。
+5.  コールバックURLにリダイレクト（認可コードと `state` を受け取る）。
+6.  **バックエンド:** `state` を検証し、対応する `code_verifier` を取得。
+7.  バックエンドが認可コードと `code_verifier` を使ってトークン（アクセストークン、リフレッシュトークン）をリクエスト。
+8.  リフレッシュトークンを **Secret Manager の鍵で暗号化** し、Firestoreに安全に保存。
+
+#### 3.2.2 認証フロー実装 (PKCE対応例)
+
+```python
+from google_auth_oauthlib.flow import Flow
+from google.oauth2.credentials import Credentials
+from core.config import settings # Secret Managerから読み込む設定クラス
+import secrets
+import hashlib
+import base64
+
+# スコープの定義
+SCOPES = [
+    'https://www.googleapis.com/auth/calendar',
+    'https://www.googleapis.com/auth/calendar.events'
+]
+
+def create_oauth_flow():
+    """OAuth 2.0フローを作成 (PKCE対応)"""
+    # client_config は Secret Manager から取得した値で構成
+    client_config = {
+        "web": {
+            "client_id": settings.GOOGLE_CLIENT_ID,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [settings.GOOGLE_REDIRECT_URI]
+        }
+    }
+    return Flow.from_client_config(client_config, scopes=SCOPES)
+
+def generate_pkce_codes():
+    """PKCE用のコードを生成"""
+    code_verifier = secrets.token_urlsafe(64)
+    # SHA256 ハッシュを計算し、Base64 URLセーフエンコード
+    code_challenge_sha256 = hashlib.sha256(code_verifier.encode('utf-8')).digest()
+    code_challenge = base64.urlsafe_b64encode(code_challenge_sha256).decode('utf-8').replace('=', '')
+    return code_verifier, code_challenge
+
+def get_authorization_url_with_pkce(flow, user_id):
+    """認証URLを生成 (PKCE対応)"""
+    code_verifier, code_challenge = generate_pkce_codes()
+    # TODO: code_verifier を user_id (または state) と紐付けて一時保存 (Firestore, Redisなど)
+    # 例: save_code_verifier(user_id, code_verifier)
+
+    flow.redirect_uri = settings.GOOGLE_REDIRECT_URI
+    state = secrets.token_urlsafe(16) # CSRF対策のstateも生成
+    # TODO: state も一時保存 (code_verifier と紐付け)
+    # 例: save_state(state, user_id)
+
+    authorization_url, _ = flow.authorization_url(
+        access_type='offline',
+        prompt='consent',
+        include_granted_scopes='true',
+        state=state, # state パラメータを追加
+        code_challenge=code_challenge, # code_challenge を追加
+        code_challenge_method='S256' # チャレンジメソッドを指定
+    )
+    return authorization_url, state # stateも返す (コールバック検証用)
+
+def exchange_code_for_token_with_pkce(flow, code, state, received_state):
+    """認可コードをトークンに交換 (PKCE対応)"""
+    # state 検証
+    # TODO: 保存した state を取得し、received_state と比較
+    # 例: expected_user_id = get_user_id_from_state(received_state)
+    # if not expected_user_id: raise ValueError("Invalid state")
+
+    # TODO: state (または user_id) に紐づく code_verifier を取得
+    # 例: code_verifier = get_code_verifier(expected_user_id)
+    # if not code_verifier: raise ValueError("Code verifier not found")
+
+    flow.redirect_uri = settings.GOOGLE_REDIRECT_URI
+    # fetch_token に code_verifier を渡す
+    flow.fetch_token(code=code, code_verifier=code_verifier)
+
+    # TODO: 使用済みの一時保存データ (state, code_verifier) を削除
+
+    return flow.credentials
+```
+*注意: 上記コードは概念的な例です。状態管理 (`state`, `code_verifier` の保存・取得・削除) の具体的な実装が必要です。*
+
+### 3.3 認証情報の保存と管理 (Firestore + 暗号化)
+
+リフレッシュトークンは **Secret Manager から取得した鍵で暗号化** して Firestore に保存します。
+
+```python
+# services/crypto_service.py (例)
+from cryptography.fernet import Fernet
+from core.config import get_secret # Secret Managerから鍵を取得する関数
+
+# アプリケーション起動時に一度だけ鍵を取得・保持
+ENCRYPTION_KEY = get_secret("google-refresh-token-encryption-key")
+fernet = Fernet(ENCRYPTION_KEY.encode())
+
+def encrypt_token(token: str) -> str:
+    """トークンを暗号化"""
+    return fernet.encrypt(token.encode()).decode()
+
+def decrypt_token(encrypted_token: str) -> str:
+    """暗号化されたトークンを復号"""
+    return fernet.decrypt(encrypted_token.encode()).decode()
+
+# repositories/user_repository.py (例)
+from google.cloud import firestore
+from models.user import UserData # Pydanticモデルなど
+from services.crypto_service import encrypt_token, decrypt_token
+
+async def save_google_credentials(line_user_id: str, credentials):
+    """ユーザーのGoogle認証情報をFirestoreに保存"""
+    db = firestore.AsyncClient()
+    user_ref = db.collection("users").document(line_user_id)
+
+    encrypted_refresh_token = None
+    if credentials.refresh_token:
+        encrypted_refresh_token = encrypt_token(credentials.refresh_token)
+
+    user_data = {
+        "google_email": credentials.id_token.get("email") if credentials.id_token else None, # IDトークンから取得推奨
+        "google_refresh_token_encrypted": encrypted_refresh_token,
+        "google_token_expiry": credentials.expiry, # datetimeオブジェクト
+        "last_updated": firestore.SERVER_TIMESTAMP
+    }
+    # ユーザーが存在しない場合は作成、存在する場合は更新
+    await user_ref.set(user_data, merge=True)
+    return True
+
+async def get_decrypted_refresh_token(line_user_id: str) -> str | None:
+    """Firestoreから復号化されたリフレッシュトークンを取得"""
+    db = firestore.AsyncClient()
+    user_ref = db.collection("users").document(line_user_id)
+    doc = await user_ref.get()
+    if doc.exists:
+        encrypted_token = doc.get("google_refresh_token_encrypted")
+        if encrypted_token:
+            return decrypt_token(encrypted_token)
+    return None
+```
+
+---
+
+## 4. イベント操作
+
+### 4.1 イベント作成
+
+```python
+from googleapiclient.discovery import build
+from datetime import datetime, timedelta
+
+def create_calendar_event(credentials, event_data):
+    """
+    カレンダーに新しいイベントを作成
+    
+    Args:
+        credentials: Google認証情報
+        event_data: イベント情報を含む辞書
+    
+    Returns:
+        作成されたイベント情報
+    """
+    service = build('calendar', 'v3', credentials=credentials)
+    
+    # イベントデータの構築
+    event = {
+        'summary': event_data.get('title', '(タイトルなし)'),
+        'location': event_data.get('location', ''),
+        'description': event_data.get('description', ''),
+        'start': {
+            'dateTime': event_data['start_time'].isoformat(),
+            'timeZone': 'Asia/Tokyo',
+        },
+        'end': {
+            'dateTime': event_data.get('end_time', event_data['start_time'] + timedelta(hours=1)).isoformat(),
+            'timeZone': 'Asia/Tokyo',
+        },
+        # リマインド設定（オプション）
+        'reminders': {
+            'useDefault': False,
+            'overrides': [
+                {'method': 'popup', 'minutes': 30},
+                {'method': 'email', 'minutes': 60}
+            ]
+        }
+    }
+    
+    # イベントの作成
+    event = service.events().insert(calendarId='primary', body=event).execute()
+    return event
+```
+
+### 4.2 イベント取得
+
+```python
+def get_calendar_events(credentials, time_min=None, time_max=None, max_results=10):
+    """
+    指定期間のカレンダーイベントを取得
+    
+    Args:
+        credentials: Google認証情報
+        time_min: 開始日時（デフォルト: 現在時刻）
+        time_max: 終了日時（デフォルト: time_minから7日後）
+        max_results: 最大取得件数
+    
+    Returns:
+        取得したイベントリスト
+    """
+    service = build('calendar', 'v3', credentials=credentials)
+    
+    # デフォルト値の設定
+    if time_min is None:
+        time_min = datetime.utcnow()
+    if time_max is None:
+        time_max = time_min + timedelta(days=7)
+    
+    # タイムゾーン付きISO形式に変換
+    time_min_str = time_min.isoformat() + 'Z'  # 'Z'はUTC
+    time_max_str = time_max.isoformat() + 'Z'
+    
+    # イベント取得
+    events_result = service.events().list(
+        calendarId='primary',
+        timeMin=time_min_str,
+        timeMax=time_max_str,
+        maxResults=max_results,
+        singleEvents=True,
+        orderBy='startTime'
+    ).execute()
+    
+    events = events_result.get('items', [])
+    return events
+```
+
+### 4.3 イベント更新
+
+```python
+def update_calendar_event(credentials, event_id, updates):
+    """
+    カレンダーイベントを更新
+    
+    Args:
+        credentials: Google認証情報
+        event_id: 更新するイベントID
+        updates: 更新内容の辞書
+    
+    Returns:
+        更新されたイベント情報
+    """
+    service = build('calendar', 'v3', credentials=credentials)
+    
+    # 既存のイベントを取得
+    event = service.events().get(calendarId='primary', eventId=event_id).execute()
+    
+    # 更新内容を適用
+    for key, value in updates.items():
+        if key in ['start', 'end']:
+            if 'dateTime' in value:
+                event[key]['dateTime'] = value['dateTime']
+            if 'timeZone' in value:
+                event[key]['timeZone'] = value['timeZone']
+        else:
+            event[key] = value
+    
+    # イベントを更新
+    updated_event = service.events().update(
+        calendarId='primary',
+        eventId=event_id,
+        body=event
+    ).execute()
+    
+    return updated_event
+```
+
+### 4.4 イベント削除
+
+```python
+def delete_calendar_event(credentials, event_id):
+    """
+    カレンダーイベントを削除
+    
+    Args:
+        credentials: Google認証情報
+        event_id: 削除するイベントID
+    
+    Returns:
+        成功した場合はTrue
+    """
+    service = build('calendar', 'v3', credentials=credentials)
+    
+    try:
+        service.events().delete(calendarId='primary', eventId=event_id).execute()
+        return True
+    except Exception as e:
+        print(f"イベント削除エラー: {e}")
+        return False
+```
+
+### 4.5 日本語による自然な日付・時間解析
+
+```python
+import re
+from datetime import datetime, timedelta
+import pytz
+
+def parse_natural_date_time(text):
+    """
+    日本語の自然な表現から日時を解析
+    
+    Args:
+        text: 解析するテキスト
+    
+    Returns:
+        解析された日時オブジェクト
+    """
+    jst = pytz.timezone('Asia/Tokyo')
+    now = datetime.now(jst)
+    
+    # 基本日付パターン
+    if '今日' in text:
+        target_date = now.date()
+    elif '明日' in text:
+        target_date = (now + timedelta(days=1)).date()
+    elif '明後日' in text:
+        target_date = (now + timedelta(days=2)).date()
+    elif '昨日' in text:
+        target_date = (now - timedelta(days=1)).date()
+    elif '一昨日' in text:
+        target_date = (now - timedelta(days=2)).date()
+    else:
+        # 月日の正規表現パターン
+        month_day_pattern = r'(\d+)月(\d+)日'
+        match = re.search(month_day_pattern, text)
+        if match:
+            month, day = int(match.group(1)), int(match.group(2))
+            year = now.year
+            
+            # 指定された日付が過去の場合、来年と判断
+            target_date_tmp = datetime(year, month, day).date()
+            if target_date_tmp < now.date() and month < now.month:
+                year += 1
+            
+            target_date = datetime(year, month, day).date()
+        else:
+            # 日付が特定できない場合は今日
+            target_date = now.date()
+    
+    # 時間パターン
+    time_pattern = r'(\d+)時((\d+)分)?'
+    match = re.search(time_pattern, text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(3)) if match.group(3) else 0
+        
+        # 午前/午後の対応
+        if '午後' in text and hour < 12:
+            hour += 12
+        elif '夜' in text and hour < 12:
+            hour += 12
+        
+        # 日付と時間を結合
+        return datetime.combine(target_date, datetime.min.time().replace(hour=hour, minute=minute)).replace(tzinfo=jst)
+    else:
+        # 時間指定がない場合
+        if 'お昼' in text or '正午' in text:
+            hour, minute = 12, 0
+        elif '朝' in text:
+            hour, minute = 9, 0
+        elif '夕方' in text:
+            hour, minute = 17, 0
+        elif '夜' in text:
+            hour, minute = 19, 0
+        else:
+            # デフォルト時間（現在時刻の次の時間）
+            hour = now.hour + 1
+            minute = 0
+        
+        return datetime.combine(target_date, datetime.min.time().replace(hour=hour, minute=minute)).replace(tzinfo=jst)
+```
+
+---
+
+## 5. リフレッシュトークン管理
+
+### 5.1 トークンの更新
+
+アクセストークンは有効期限が短いため、API呼び出し前に有効期限を確認し、必要であればリフレッシュトークンを使って更新します。
+
+```python
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request # google-authライブラリのRequestを使用
+from googleapiclient.discovery import build
+from core.config import settings # Secret Managerから読み込む設定クラス
+from repositories.user_repository import get_decrypted_refresh_token, save_google_credentials # Firestore操作
+
+async def get_valid_credentials(line_user_id: str) -> Credentials | None:
+    """
+    有効なGoogle認証情報を取得（必要なら更新）
+    """
+    refresh_token = await get_decrypted_refresh_token(line_user_id)
+    if not refresh_token:
+        return None
+
+    # Credentialsオブジェクトを作成
+    # Firestoreにアクセストークンや有効期限も保存しておき、それを初期値として使うことも可能
+    credentials = Credentials(
+        None, # 保存しておいたアクセストークン or None
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=settings.GOOGLE_CLIENT_ID,
+        client_secret=settings.GOOGLE_CLIENT_SECRET,
+        scopes=SCOPES
+        # expiry=保存しておいた有効期限 or None
+    )
+
+    # 有効期限が切れているか、まもなく切れそうな場合は更新
+    if not credentials.valid or (credentials.expiry and credentials.expiry < datetime.utcnow() + timedelta(minutes=5)):
+        try:
+            request = Request() # google.auth.transport.requests.Request
+            credentials.refresh(request)
+            # 更新された認証情報（新しいアクセストークン、有効期限）を保存
+            # await save_google_credentials(line_user_id, credentials) # リフレッシュトークンは変わらないので注意
+            print(f"Token refreshed for user {line_user_id}") # ログ推奨
+        except Exception as e:
+            print(f"Failed to refresh token for user {line_user_id}: {e}") # ログ推奨
+            # TODO: リフレッシュトークンが無効になった場合の処理 (ユーザーに再連携を促すなど)
+            return None
+
+    return credentials
+```
+*注意: 上記はアクセストークンを都度更新する例です。パフォーマンス向上のため、更新したアクセストークンと有効期限をFirestoreに保存し、有効期限内はそれを利用するキャッシュ戦略も有効です。*
+
+### 5.2 エラー処理とリトライ
+
+トークンの有効期限切れや更新失敗時のエラー処理は重要です。以下はその実装例です：
+
+```python
+from googleapiclient.errors import HttpError
+
+def execute_with_retry(service_func, max_retries=3):
+    """
+    API呼び出しを実行し、必要に応じてリトライ
+    
+    Args:
+        service_func: 実行する関数
+        max_retries: 最大リトライ回数
+    
+    Returns:
+        関数の実行結果
+    """
+    retries = 0
+    while retries < max_retries:
+        try:
+            return service_func()
+        except HttpError as error:
+            if error.resp.status in [401, 403]:  # 認証エラー
+                if retries < max_retries - 1:
+                    # 認証情報を更新してリトライ
+                    retries += 1
+                    print(f"認証エラー、リトライ {retries}/{max_retries}")
+                    credentials.refresh(Request())
+                    continue
+            
+            # その他のエラーまたは最大リトライ回数に達した場合
+            raise
+```
+
+### 5.3 リフレッシュトークンの有効期限と自動更新
+
+**重要**: Googleのリフレッシュトークンは、特にテスト環境では短期間（7日）で失効します。本番環境でも非アクティブ状態が続くと失効します。
+
+**対策:**
+
+1.  **定期的な利用:** APIを定期的に（少なくとも6ヶ月に1回）利用することで、トークンの有効期限を延長します。
+2.  **自動更新タスク:** **Cloud Scheduler** と **Cloud Tasks** を利用して、定期的に（例: 毎日 or 週1回）全ユーザーのリフレッシュトークンを使ってアクセストークンを更新するバッチ処理を実行します。これにより、トークンがアクティブな状態に保たれます。
+    *   SchedulerがTasksにユーザーごとのトークン更新タスクを追加。
+    -   TasksがCloud Runの `/tasks/token/refresh` エンドポイントを呼び出す。
+    -   エンドポイント内で `get_valid_credentials` を呼び出し、トークン更新を試みる。
+3.  **失効時の対応:** トークン更新に失敗した場合（リフレッシュトークンが無効になった場合）、ユーザーにLINEメッセージで通知し、LIFFアプリ経由での再連携を促します。Firestoreのユーザーステータスも更新します。
+
+### 5.4 トークンの検証 (API呼び出しによる)
+
+リフレッシュトークンが実際に有効かを確認する最も確実な方法は、それを使ってAPIを呼び出してみることです。`get_valid_credentials` 関数内で更新を試みる際に、実質的に検証が行われます。更新に失敗した場合はトークンが無効と判断できます。
+
+```python
+def verify_token(db, user_id):
+    """
+    保存されたトークンが有効かどうかを確認
+    
+    Args:
+        db: データベースセッション
+        user_id: ユーザーID
+    
+    Returns:
+        トークンが有効な場合はTrue
+    """
+    try:
+        # ユーザーからトークンを取得
+        user = db.query(User).filter(User.id == user_id).first()
+        
+        if not user:
+            return False
+        
+        token = db.query(Token).filter(Token.user_id == user.id).first()
+        
+        if not token or not token.google_refresh_token:
+            return False
+        
+        # リフレッシュトークンを使って認証情報を取得
+        credentials = get_refreshed_credentials(token.google_refresh_token)
+        
+        # APIをテスト呼び出し
+        service = build('calendar', 'v3', credentials=credentials)
+        service.calendarList().list(maxResults=1).execute()
+        
+        return True
+    except Exception as e:
+        print(f"Token verification error: {e}")
+        return False
+```
+
+---
+
+## 6. 制限とベストプラクティス
+
+### 6.1 API制限
+
+GoogleカレンダーAPIには以下の制限があります（2025年4月現在）：
+
+- **日次クォータ**: 1,000,000クエリ/日（プロジェクト単位）
+- **ユーザーごとのレート制限**: 600クエリ/分/ユーザー
+- **100秒あたりのリクエスト数**: 500リクエスト/100秒
+
+これらの制限を超えると、APIは429エラー（Too Many Requests）を返します。
+
+### 6.2 ベストプラクティス
+
+#### 6.2.1 API呼び出しの最適化
+
+1. **バッチリクエストの使用**:
+   複数のイベントを個別に操作するのではなく、バッチリクエストを利用して効率化
+
+   ```python
+   def batch_get_events(credentials, event_ids):
+       """複数のイベントをバッチ取得"""
+       service = build('calendar', 'v3', credentials=credentials)
+       batch = service.new_batch_http_request()
+       
+       results = {}
+       
+       for i, event_id in enumerate(event_ids):
+           batch.add(
+               service.events().get(calendarId='primary', eventId=event_id),
+               callback=lambda request_id, response, exception: set_result(results, request_id, response, exception)
+           )
+       
+       batch.execute()
+       return results
+   ```
+
+2. **キャッシング**:
+   頻繁にアクセスするデータをキャッシュして、API呼び出し回数を削減
+
+   ```python
+   from functools import lru_cache
+   
+   @lru_cache(maxsize=100)
+   def get_cached_event(service, event_id):
+       """イベント情報をキャッシュ付きで取得"""
+       return service.events().get(calendarId='primary', eventId=event_id).execute()
+   ```
+
+3. **増分同期**:
+   全イベントを毎回取得するのではなく、変更されたイベントのみを取得
+
+   ```python
+   def sync_events(credentials, sync_token=None):
+       """増分同期を使ってイベントを取得"""
+       service = build('calendar', 'v3', credentials=credentials)
+       
+       params = {
+           'calendarId': 'primary',
+           'singleEvents': True,
+           'maxResults': 2500
+       }
+       
+       if sync_token:
+           params['syncToken'] = sync_token
+       else:
+           # 初回同期の場合は時間範囲を指定
+           params['timeMin'] = datetime.utcnow().isoformat() + 'Z'
+       
+       events_result = service.events().list(**params).execute()
+       
+       # 次回の同期で使用するトークンを保存
+       next_sync_token = events_result.get('nextSyncToken')
+       
+       return events_result.get('items', []), next_sync_token
+   ```
+
+#### 6.2.2 エラー対応
+
+1. **指数バックオフ**:
+   API制限に達した場合、待機時間を徐々に増やしてリトライ
+
+   ```python
+   import time
+   import random
+   
+   def exponential_backoff(func, max_retries=5):
+       """指数バックオフを使った関数実行"""
+       for n in range(max_retries):
+           try:
+               return func()
+           except HttpError as e:
+               if e.resp.status == 429:  # レート制限超過
+                   if n == max_retries - 1:
+                       raise
+                   
+                   # 待機時間を計算 (2^n + ランダム値)
+                   delay = (2 ** n) + random.random()
+                   print(f"Rate limit exceeded. Retrying in {delay:.2f} seconds...")
+                   time.sleep(delay)
+               else:
+                   raise
+   ```
+
+2. **グレースフル・デグラデーション**:
+   API障害時に最低限の機能を維持する
+
+   ```python
+   def get_events_with_fallback(credentials, time_min, time_max):
+       """イベント取得とフォールバック処理"""
+       try:
+           # 通常のイベント取得を試行
+           return get_calendar_events(credentials, time_min, time_max)
+       except Exception as e:
+           print(f"API error: {e}")
+           # フォールバック: 最後に成功したキャッシュデータを使用
+           return get_cached_events() or []
+   ```
+
+---
+
+## 7. エラー処理とトラブルシューティング
+
+### 7.1 一般的なエラーとその対処法
+
+| エラーコード | 説明 | 対処法 |
+|------------|------|-------|
+| 400 (Bad Request) | リクエストのフォーマットが不正 | パラメータの形式を確認 |
+| 401 (Unauthorized) | 認証情報が無効 | トークンを更新または再認証 |
+| 403 (Forbidden) | アクセス権限がない | スコープの確認、権限の要求 |
+| 404 (Not Found) | リソースが存在しない | IDやパスを確認 |
+| 429 (Too Many Requests) | レート制限を超過 | バックオフ&リトライ、呼び出し最適化 |
+| 500 (Internal Server Error) | Googleサーバーエラー | リトライ、ステータス確認 |
+
+### 7.2 トラブルシューティング手順
+
+1. **認証エラー**:
+   - リフレッシュトークンが有効か確認
+   - スコープが適切か確認
+   - OAuth同意画面の設定を確認
+
+2. **イベント操作エラー**:
+   - イベントIDが正しいか確認
+   - ユーザーがカレンダーへの適切なアクセス権を持っているか確認
+   - リクエストの形式が正しいか確認
+
+3. **レート制限エラー**:
+   - API使用状況をモニタリング
+   - バッチ処理を導入
+   - キャッシング戦略を見直し
+
+### 7.3 ロギングとモニタリング (GCP連携)
+
+**Cloud Logging** と **Cloud Monitoring** を活用して、API連携の問題を早期に発見し、デバッグを効率化します。
+
+-   **構造化ログ:** API呼び出しの成功・失敗、パラメータ、レスポンスタイム、エラー詳細などを構造化ログとしてCloud Loggingに出力します。Trace IDを含めることで、リクエスト全体の追跡が容易になります。
+-   **モニタリング:** Cloud Monitoringで以下のメトリクスを監視します。
+    -   Google Calendar API呼び出しのエラー率
+    -   API呼び出しのレイテンシ
+    -   トークン更新失敗のアラート
+    -   4xx/5xxエラーの発生頻度
+-   **ログベースのアラート:** 特定のエラーメッセージ（例: "invalid_grant" - トークン無効）がログに出力された場合にアラートを発生させ、迅速な対応を可能にします。
+
+```python
+# core/logging.py (例)
+import logging
+import google.cloud.logging
+from google.cloud.logging.handlers import CloudLoggingHandler
+import os
+
+client = google.cloud.logging.Client()
+handler = CloudLoggingHandler(client, name=os.getenv("K_SERVICE", "calendar-agent-local"))
+
+# 標準のloggingにハンドラを追加
+logging.getLogger().setLevel(logging.INFO) # または DEBUG
+logging.getLogger().addHandler(handler)
+
+# 使用例
+logging.info("Starting Google Calendar API call", extra={"json_fields": {"user_id": "...", "event_id": "..."}})
+try:
+    # API呼び出し
+    logging.info("Google Calendar API call successful", extra={"json_fields": {"latency_ms": 123}})
+except Exception as e:
+    logging.error("Google Calendar API call failed", exc_info=True, extra={"json_fields": {"error_type": type(e).__name__}})
+
+```
+*注意: Cloud Run環境では標準出力/エラー出力が自動的にCloud Loggingに収集されるため、上記のような明示的なハンドラ設定は不要な場合もありますが、構造化ログのためには `python-json-logger` 等の利用が推奨されます。*
+
+---
+
+## 8. 自然言語処理との連携例
+
+### 8.1 初期リリース (パターン認識ベース)
+
+LINEボットが受け取ったメッセージをパターン認識エンジン (`NLPEngine`) に渡し、抽出された情報に基づいてカレンダー操作を行います。
+
+```python
+# services/line_service.py (handle_message 関数の内部イメージ)
+from nlp.intent_parser import parse_intent_and_entities # パターン認識エンジン (仮)
+from services.google_calendar_service import add_event, get_events # カレンダー操作サービス (仮)
+
+async def handle_message(line_user_id: str, text: str, user_info):
+    # 1. パターン認識エンジンで意図と情報を抽出
+    parsed_result = parse_intent_and_entities(text)
+    intent = parsed_result.get("intent")
+    entities = parsed_result.get("entities") # 例: {"title": "会議", "start_time": datetime(...), ...}
+
+    # 2. 有効な認証情報を取得
+    credentials = await get_valid_credentials(line_user_id)
+    if not credentials:
+        return ["Googleアカウントとの連携が必要です。LIFFアプリから設定してください。"] # エラーメッセージ
+
+    # 3. 意図に応じてカレンダー操作を実行
+    reply_messages = []
+    if intent == "add_event" and entities.get("start_time") and entities.get("title"):
+        try:
+            # 必要な情報を event_data に整形
+            event_data = {
+                "title": entities["title"],
+                "start_time": entities["start_time"],
+                "end_time": entities.get("end_time"), # なければ add_event 内で処理
+                "location": entities.get("location"),
+                "description": entities.get("description")
+            }
+            created_event = await add_event(credentials, event_data) # 非同期に変更推奨
+            reply_messages.append(f"予定「{created_event['summary']}」を追加しました。")
+        except Exception as e:
+            logging.error(f"Failed to add event for {line_user_id}: {e}", exc_info=True)
+            reply_messages.append("予定の追加に失敗しました。")
+
+    elif intent == "get_events":
+        try:
+            time_min = entities.get("start_time", datetime.now(pytz.timezone('Asia/Tokyo')))
+            time_max = entities.get("end_time") # なければ get_events 内で処理
+            events = await get_events(credentials, time_min, time_max) # 非同期に変更推奨
+            if events:
+                # イベント情報を整形してメッセージを作成
+                formatted_events = format_events_for_line(events) # 整形関数 (仮)
+                reply_messages.extend(formatted_events)
+            else:
+                reply_messages.append("指定された期間に予定はありません。")
+        except Exception as e:
+            logging.error(f"Failed to get events for {line_user_id}: {e}", exc_info=True)
+            reply_messages.append("予定の取得に失敗しました。")
+
+    # elif intent == "update_event": ...
+    # elif intent == "delete_event": ...
+    else:
+        # 意図が不明な場合や情報不足の場合
+        # TODO: ユーザーに確認を求めるか、ヘルプメッセージを返す
+        reply_messages.append("すみません、よく分かりませんでした。もう一度試してください。")
+
+    return reply_messages
+
+```
+
+### 8.2 リリース後 (OpenAI Agents SDK連携)
+
+パターン認識エンジンをOpenAI Agents SDKに置き換えるか、連携させます。カレンダー操作はツールとして定義します。
+
+```python
+# agents/calendar_agent.py (例)
+from openai_agents import Runner, Agent, FunctionTool
+from services.google_calendar_service import add_event, get_events, update_event, delete_event # カレンダー操作サービス
+from services.auth_service import get_valid_credentials_sync # 同期版の認証情報取得 (Runnerが同期の場合)
+
+class CalendarTools:
+    """GoogleカレンダーAPIを操作するためのツール集"""
+    def __init__(self, line_user_id: str):
+        self.line_user_id = line_user_id
+        # 注意: Runnerが非同期実行をサポートしていない場合、
+        # ここで同期的に認証情報を取得するか、各ツールメソッド内で非同期処理を呼び出す工夫が必要
+        self.credentials = get_valid_credentials_sync(self.line_user_id) # 同期版 (仮)
+
+    def add_calendar_event_tool(self, title: str, start_time: str, end_time: str = None, description: str = None, location: str = None) -> dict:
+        """Googleカレンダーに新しい予定を追加します。日時はISO 8601形式 (YYYY-MM-DDTHH:MM:SS+09:00) で指定してください。"""
+        if not self.credentials: return {"status": "error", "message": "認証エラー"}
+        event_data = {"title": title, "start_time": start_time, "end_time": end_time, "description": description, "location": location}
+        # TODO: add_event を呼び出す (非同期の場合は event loop 等で実行)
+        # result = await add_event(self.credentials, event_data)
+        result = {"status": "success", "message": f"予定「{title}」を追加しました。(仮)"} # 仮実装
+        return result
+
+    # get_events, update_event, delete_event も同様にツールとして定義
+
+class CalendarAgent:
+    """カレンダー管理エージェント"""
+    def __init__(self):
+        # エージェント定義 (ツールはインスタンスメソッドを参照)
+        self.agent = Agent(
+            name="カレンダーアシスタント",
+            description="LINEを通じてGoogleカレンダーを管理するアシスタント...",
+            model="gpt-4o", # または他のモデル
+            # tools は実行時に動的に生成
+        )
+        self.runner = Runner()
+
+    def process_message(self, message: str, line_user_id: str) -> str:
+        """ユーザーメッセージを処理"""
+        try:
+            # ユーザーごとにツールインスタンスを作成
+            calendar_tools = CalendarTools(line_user_id)
+            tools = [
+                FunctionTool(calendar_tools.add_calendar_event_tool),
+                # 他のツールも追加
+            ]
+            # エージェントにツールを設定 (実行ごとに設定 or Agent定義時に渡す)
+            self.agent.tools = tools
+
+            # エージェント実行
+            response = self.runner.run(self.agent, message)
+            return response.content
+        except Exception as e:
+            logging.error(f"Agent processing failed for {line_user_id}: {e}", exc_info=True)
+            return "申し訳ありません、処理中にエラーが発生しました。"
+
+```
+*注意: OpenAI Agents SDKの非同期サポートやコンテキスト管理の詳細は、SDKのバージョンや仕様によって変わる可能性があります。上記は概念的な例です。*
+
+---
+
+## 9. 参考リソース
+
+### 9.1 公式ドキュメント
+
+- [Google Calendar API 概要](https://developers.google.com/calendar/api/guides/overview)
+- [Google Calendar API リファレンス](https://developers.google.com/calendar/api/v3/reference)
+- [Google OAuth 2.0 ガイド](https://developers.google.com/identity/protocols/oauth2)
+- [Google API Python Client](https://github.com/googleapis/google-api-python-client)
+
+### 9.2 チュートリアルとサンプル
+
+- [Google Calendar API クイックスタート](https://developers.google.com/calendar/api/quickstart/python)
+- [Calendar API サンプルコード](https://github.com/googleapis/google-api-python-client/tree/main/samples/calendar)
+
+### 9.3 有用なツール
+
+- [OAuth 2.0 Playground](https://developers.google.com/oauthplayground/) - OAuth認証フローをテスト
+- [Google API Explorer](https://developers.google.com/apis-explorer/#p/calendar/v3/) - APIリクエストのテスト
+- [Google Cloud Console](https://console.cloud.google.com/) - APIプロジェクト管理

@@ -1,0 +1,612 @@
+# OpenAI Agents SDK 導入ガイド (将来拡張向け)
+**GoogleカレンダーLINE連携プロジェクト向け**
+
+*2025年4月7日作成 (2025年4月14日 更新: 初期リリース後の導入を想定)*
+
+**注意:** このガイドは、初期リリース完了後の機能拡張フェーズにおける OpenAI Agents SDK 導入を想定したものです。初期リリースでは、パターン認識ベースの自然言語処理を実装します。
+
+## 1. OpenAI Agents SDKとは
+
+OpenAI Agents SDKは、AIエージェントを効率的に構築するための最新のソフトウェア開発キットです。2025年3月にOpenAIから正式リリースされ、従来のAPIと比較して大幅に機能が強化されています。
+
+### 1.1 主な特徴
+
+- **軽量かつパワフル**: 少ない抽象化で使いやすく、本番環境にも対応
+- **ツール統合**: さまざまなツール（APIやサービス）をAIに接続し、適切に利用可能
+- **マルチエージェント対応**: 複数のAIエージェントが協調して作業できる
+- **トレーシング機能**: エージェントの動作を追跡・デバッグする機能を内蔵
+- **安全性と制御**: ガードレールを設定し、入力検証や制限を適用可能
+
+### 1.2 従来のOpenAI APIとの違い
+
+| 特徴 | 従来のAPI | Agents SDK |
+|------|----------|------------|
+| 機能呼び出し | 単一機能の呼び出し | 複数ツール・APIの連携と自動選択 |
+| 複雑さの対応 | 開発者が全てを実装 | タスク分解と連鎖処理をSDKが支援 |
+| 状態管理 | 手動で実装 | コンテキスト管理機能内蔵 |
+| デバッグ | 困難 | トレース機能で可視化可能 |
+| 多段階処理 | 複雑な実装が必要 | 自然な形で実装可能 |
+
+## 2. インストールと初期設定
+
+### 2.1 インストール
+
+```bash
+pip install openai-agents
+```
+
+必要に応じて仮想環境内にインストールすることをお勧めします：
+
+```bash
+# 仮想環境作成
+python -m venv venv
+source venv/bin/activate  # Windowsの場合: venv\Scripts\activate
+
+# インストール
+pip install openai-agents
+```
+
+### 2.2 API設定
+
+```python
+import os
+from openai import OpenAI
+from openai_agents import Runner, Agent
+
+# APIキーの設定
+os.environ["OPENAI_API_KEY"] = "your-api-key"
+
+# または直接クライアントを初期化
+client = OpenAI(api_key="your-api-key")
+```
+
+## 3. 基本的な使い方
+
+### 3.1 基本的なエージェントの作成
+
+```python
+from openai_agents import Runner, Agent
+
+# エージェントを定義
+agent = Agent(
+    name="calendar_assistant",
+    description="Googleカレンダーを管理し、予定の追加・確認・更新・削除を行います。",
+    model="gpt-4o",
+)
+
+# ランナーを作成して実行
+runner = Runner()
+response = runner.run(agent, "明日の午後3時にミーティングを予定に入れてください")
+print(response.content)
+```
+
+### 3.2 カスタムツールの定義
+
+```python
+from openai_agents import FunctionTool
+
+# カレンダー追加ツールの定義
+def add_calendar_event(title: str, start_time: str, end_time: str = None, description: str = None):
+    """
+    Googleカレンダーに予定を追加します。
+    
+    Args:
+        title: 予定のタイトル
+        start_time: 開始時間（ISO形式）
+        end_time: 終了時間（ISO形式、省略可）
+        description: 予定の詳細（省略可）
+    
+    Returns:
+        dict: 追加された予定の情報
+    """
+    # ここに実際のGoogleカレンダーAPI呼び出しを実装
+    # （プロジェクトの既存コードを活用）
+    
+    return {"status": "success", "event_id": "123456"}
+
+# ツールをエージェントに登録
+calendar_tool = FunctionTool(add_calendar_event)
+agent = Agent(
+    name="calendar_assistant",
+    description="Googleカレンダーを管理するアシスタント",
+    model="gpt-4o",
+    tools=[calendar_tool]
+)
+```
+
+## 4. GoogleカレンダーとLINE連携への応用
+
+### 4.1 プロジェクトへの統合方法 (リリース後の拡張)
+
+初期リリースではパターン認識ベースのNLPエンジン (`nlp/` ディレクトリ等) を実装します。リリース後、OpenAI Agents SDKを導入する際の統合方法は以下のようになります。
+
+1.  **`agents` ディレクトリの作成/拡張:**
+    *   Agents SDK ベースのエージェント (`CalendarAgent` など) を実装します。
+    *   各種ツール (カレンダー操作など) を定義するファイルを追加します。
+2.  **既存NLPエンジンとの連携/置換:**
+    *   パターン認識エンジンを Agents SDK で完全に置き換えるか、あるいは Agents SDK がパターン認識エンジンをツールの一つとして呼び出すハイブリッド構成も検討可能です。
+3.  **カレンダーサービスとの連携:**
+    *   `services/google_calendar_service.py` などの既存サービス内の関数を、Agents SDK の `FunctionTool` としてラップします。
+    *   ツール関数内で、ユーザーIDに基づいて適切な認証情報 (Credentials) を取得する処理が必要です。
+
+### 4.2 実装例：自然言語エージェントの更新
+
+```python
+# src/agents/natural_language_agent.py の更新例
+
+from datetime import datetime, timedelta
+import pytz
+from typing import Dict, Any
+from openai_agents import Runner, Agent, FunctionTool
+
+from ..config.settings import get_settings
+from ..services.calendar_service import CalendarService
+
+settings = get_settings()
+
+class NaturalLanguageAgent:
+    def __init__(self):
+        self.jst = pytz.timezone('Asia/Tokyo')
+        self.calendar_service = CalendarService()
+        
+        # ツールの定義
+        self.add_event_tool = FunctionTool(self.add_event)
+        self.view_events_tool = FunctionTool(self.view_events)
+        self.update_event_tool = FunctionTool(self.update_event)
+        self.delete_event_tool = FunctionTool(self.delete_event)
+        
+        # エージェントの定義
+        self.agent = Agent(
+            name="calendar_assistant",
+            description="LINEを通じてGoogleカレンダーを管理するアシスタント",
+            model="gpt-4o",
+            tools=[
+                self.add_event_tool,
+                self.view_events_tool,
+                self.update_event_tool,
+                self.delete_event_tool
+            ]
+        )
+        
+        # ランナーの初期化
+        self.runner = Runner()
+    
+    def analyze_message(self, message: str, user_id: str) -> str:
+        """
+        ユーザーメッセージを解析し、適切な応答を返す
+        """
+        try:
+            # コンテキストを作成（ユーザーIDなど必要な情報を含む）
+            context = {"user_id": user_id}
+            
+            # エージェントを実行
+            response = self.runner.run(self.agent, message, context=context)
+            
+            # 応答内容を返す
+            return response.content
+        
+        except Exception as e:
+            print(f"Error in analyze_message: {str(e)}")
+            return "申し訳ありません。エラーが発生しました。"
+    
+    # ツール関数の実装
+    def add_event(self, title: str, start_time: str, end_time: str = None, 
+                  description: str = None, location: str = None, user_id: str = None) -> Dict[str, Any]:
+        """
+        カレンダーに予定を追加
+        """
+        # userIdをコンテキストから取得
+        # Googleカレンダー連携の既存コードを活用
+        # ...
+        return {"status": "success", "message": f"予定「{title}」を追加しました。"}
+    
+    def view_events(self, date: str = None, days: int = 1, user_id: str = None) -> Dict[str, Any]:
+        """
+        指定日の予定を取得
+        """
+        # 実装...
+        return {"events": [...], "message": "予定を取得しました。"}
+    
+    def update_event(self, event_id: str, updates: Dict[str, Any], user_id: str = None) -> Dict[str, Any]:
+        """
+        予定を更新
+        """
+        # 実装...
+        return {"status": "success", "message": "予定を更新しました。"}
+    
+    def delete_event(self, event_id: str, user_id: str = None) -> Dict[str, Any]:
+        """
+        予定を削除
+        """
+        # 実装...
+        return {"status": "success", "message": "予定を削除しました。"}
+```
+
+### 4.3 LINE Botコントローラーとの連携
+
+```python
+# src/controllers/line_controller.py の更新箇所
+
+def handle_text_message(event: MessageEvent):
+    try:
+        # Initialize services
+        line_service = LineService(line_bot_api)
+        nlp_agent = NaturalLanguageAgent()
+
+        # Process the message using NLP agent
+        # エージェントSDKを使用した新しい処理
+        user_message = event.message.text
+        response = nlp_agent.analyze_message(user_message, event.source.user_id)
+
+        # Send response back to user
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=response)
+        )
+
+    except Exception as e:
+        # Log the error and send a generic error message
+        print(f"Error processing message: {str(e)}")
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="申し訳ありません。エラーが発生しました。")
+        )
+```
+
+## 5. 高度な機能
+
+### 5.1 マルチターン会話管理
+
+```python
+from openai_agents import ConversationMemory
+
+# 会話メモリを追加
+memory = ConversationMemory()
+
+# エージェント定義時に会話メモリを設定
+agent = Agent(
+    name="calendar_assistant",
+    description="カレンダー管理アシスタント",
+    model="gpt-4o",
+    tools=[...],
+    memory=memory
+)
+```
+
+### 5.2 トレーシングとデバッグ
+
+```python
+from openai_agents import configure_logging
+import logging
+
+# ログレベルの設定
+configure_logging(level=logging.DEBUG)
+
+# トレースの詳細設定
+runner = Runner(
+    trace_config={
+        "verbose": True,
+        "dump_trace": True,
+    }
+)
+```
+
+### 5.3 エラーハンドリングとガードレール
+
+```python
+from openai_agents import Guard, ResponseValidation
+
+# ガードレールの設定
+guard = Guard(
+    response_validations=[
+        ResponseValidation(
+            name="予定追加検証",
+            description="予定追加リクエストが適切かチェック",
+            validation_fn=lambda response, context: "予定" in response.content
+        )
+    ]
+)
+
+# エージェントにガードレールを適用
+agent = Agent(
+    name="calendar_assistant",
+    description="カレンダー管理アシスタント",
+    model="gpt-4o",
+    tools=[...],
+    guard=guard
+)
+```
+
+## 6. 将来的な実装計画 (リリース後)
+
+### 6.1 パターン認識からの移行ステップ (目安)
+
+初期リリースのパターン認識エンジンから OpenAI Agents SDK へ移行する際のステップ案です。
+
+1.  **環境設定の更新:**
+    *   `openai-agents` パッケージを `requirements.txt` に追加し、インストール。
+    *   OpenAI APIキーを GCP Secret Manager に追加し、設定ファイル (`core/config.py`) で読み込めるようにする。
+2.  **基本エージェントとツールの実装:**
+    *   `agents/` ディレクトリを作成し、`CalendarAgent` クラスを定義。
+    *   既存のカレンダー操作サービス (`services/google_calendar_service.py`) の関数をラップする `FunctionTool` を `agents/calendar_tools.py` などに実装。ツール関数内でユーザーIDに基づき認証情報を取得する処理を追加。
+3.  **NLP処理の切り替え:**
+    *   LINE Webhookハンドラ (`controllers/line_controller.py` の `handle_text_message` など) で、パターン認識エンジンの呼び出し部分を `CalendarAgent` の呼び出しに切り替える。
+    *   必要に応じて、パターン認識エンジンをツールの一つとして残すハイブリッド構成も検討。
+4.  **テストと評価:**
+    *   Agents SDK を利用した場合の応答精度、対応可能な表現の範囲、エラーハンドリング、トークン消費量などを評価する。
+    *   既存のテストケースを更新し、新しいテストケースを追加する。
+5.  **高度な機能の実装 (オプション):**
+    *   会話メモリ (`ConversationMemory`) の導入によるマルチターン会話対応。
+    *   ガードレール (`Guard`) の設定による安全性向上。
+    *   トレーシング機能の活用によるデバッグ効率化。
+
+### 6.2 実装時のチェックリスト (リリース後)
+
+- [ ] `requirements.txt` に `openai-agents` を追加。
+- [ ] OpenAI APIキーを Secret Manager に設定。
+- [ ] `agents/` ディレクトリを作成し、`CalendarAgent` を実装。
+- [ ] カレンダー操作サービス関数を `FunctionTool` として定義。
+- [ ] ツール関数内でユーザー認証情報を正しく取得・利用する処理を実装。
+- [ ] Webhookハンドラで NLP処理を `CalendarAgent` 呼び出しに切り替え。
+- [ ] (オプション) 会話メモリ、ガードレール、トレーシングを設定。
+- [ ] 関連する単体テスト、結合テスト、E2Eテストを実装・更新。
+- [ ] トークン使用量とコストを監視する仕組みを検討。
+
+### 6.3 テスト戦略 (Agents SDK導入後)
+
+1.  **ツール単体テスト:** 各 `FunctionTool` が、モックされた入力に対して期待されるカレンダー操作（またはエラー）を実行するかテストする。
+2.  **エージェント応答テスト:** 特定の入力メッセージに対し、エージェントが期待されるツールを呼び出し、適切な応答コンテンツを生成するかテストする（モックツール使用）。
+3.  **統合テスト:** Webhookハンドラからエージェント呼び出し、ツール実行、応答生成までの一連の流れをテストする（外部APIはモック）。
+4.  **E2Eテスト (ステージング):** 実際のLINE、Google API、OpenAI APIと連携させ、様々なシナリオ（複雑な指示、曖昧な表現、エラーケースなど）をテストする。パターン認識ベースの場合と比較して、改善点や新たな問題点がないか確認する。
+
+## 7. サンプルコード：基本機能実装
+
+### 7.1 カレンダー操作ツールの完全実装例
+
+```python
+# src/tools/calendar_tools.py
+
+from datetime import datetime, timedelta
+import pytz
+from typing import Dict, Any, List, Optional
+from pydantic import BaseModel
+from openai_agents import FunctionTool
+
+from ..services.calendar_service import CalendarService
+
+class EventInput(BaseModel):
+    title: str
+    start_time: str
+    end_time: Optional[str] = None
+    description: Optional[str] = None
+    location: Optional[str] = None
+
+class EventOutput(BaseModel):
+    event_id: str
+    status: str
+    message: str
+
+class CalendarTools:
+    """GoogleカレンダーAPIを操作するためのツール集"""
+    
+    def __init__(self):
+        self.calendar_service = CalendarService()
+        self.jst = pytz.timezone('Asia/Tokyo')
+    
+    def add_event(self, 
+                 title: str, 
+                 start_time: str, 
+                 end_time: str = None, 
+                 description: str = None, 
+                 location: str = None,
+                 user_id: str = None) -> Dict[str, Any]:
+        """
+        Googleカレンダーに新しい予定を追加します。
+        
+        Args:
+            title: 予定のタイトル
+            start_time: 開始時間 (ISO形式 または 「2025-04-08T15:00:00+09:00」形式)
+            end_time: 終了時間 (ISO形式、省略時は開始時間+1時間)
+            description: 予定の詳細説明
+            location: 場所
+            user_id: ユーザーID (コンテキストから取得)
+            
+        Returns:
+            予定の追加結果
+        """
+        try:
+            # 終了時間が指定されていない場合は1時間後に設定
+            if not end_time:
+                start_dt = datetime.fromisoformat(start_time)
+                end_time = (start_dt + timedelta(hours=1)).isoformat()
+            
+            # カレンダーサービスを初期化
+            # ※実際にはuser_idからトークンを取得して初期化する必要あり
+            # ...
+            
+            # 予定を追加
+            event = self.calendar_service.add_event(
+                title=title,
+                start_time=datetime.fromisoformat(start_time),
+                end_time=datetime.fromisoformat(end_time),
+                description=description,
+                location=location
+            )
+            
+            return {
+                "event_id": event["id"],
+                "status": "success",
+                "message": f"予定「{title}」を{start_time}に追加しました。"
+            }
+            
+        except Exception as e:
+            print(f"Error adding event: {str(e)}")
+            return {
+                "event_id": "",
+                "status": "error",
+                "message": f"予定の追加に失敗しました: {str(e)}"
+            }
+    
+    def get_events(self, 
+                  date: str = None, 
+                  days: int = 1,
+                  user_id: str = None) -> Dict[str, Any]:
+        """
+        指定日の予定を取得します。
+        
+        Args:
+            date: 取得する日付 (ISO形式 または 「2025-04-08」形式、省略時は今日)
+            days: 取得する日数 (省略時は1日)
+            user_id: ユーザーID (コンテキストから取得)
+            
+        Returns:
+            予定リスト
+        """
+        try:
+            # 日付が指定されていない場合は今日を使用
+            if not date:
+                time_min = datetime.now(self.jst).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+            else:
+                if "T" in date:
+                    time_min = datetime.fromisoformat(date)
+                else:
+                    time_min = datetime.fromisoformat(f"{date}T00:00:00+09:00")
+            
+            # 終了日を計算
+            time_max = time_min + timedelta(days=days)
+            
+            # カレンダーサービスを初期化
+            # ...
+            
+            # 予定を取得
+            events = self.calendar_service.get_events(
+                time_min=time_min,
+                time_max=time_max
+            )
+            
+            # 予定を整形
+            formatted_events = []
+            for event in events:
+                formatted_event = self.calendar_service.format_event_for_display(event)
+                formatted_events.append(formatted_event)
+            
+            # 日付文字列を整形
+            date_str = time_min.strftime("%Y年%m月%d日")
+            if days > 1:
+                end_date_str = time_max.strftime("%Y年%m月%d日")
+                date_range = f"{date_str}から{end_date_str}まで"
+            else:
+                date_range = date_str
+            
+            return {
+                "events": formatted_events,
+                "count": len(formatted_events),
+                "date_range": date_range,
+                "message": f"{date_range}の予定は{len(formatted_events)}件です。"
+            }
+            
+        except Exception as e:
+            print(f"Error getting events: {str(e)}")
+            return {
+                "events": [],
+                "count": 0,
+                "date_range": "",
+                "message": f"予定の取得に失敗しました: {str(e)}"
+            }
+    
+    # 他の機能（予定の更新・削除など）も同様に実装
+    # ...
+
+# ツールとして登録
+calendar_tools = CalendarTools()
+add_event_tool = FunctionTool(calendar_tools.add_event)
+get_events_tool = FunctionTool(calendar_tools.get_events)
+# update_event_tool = FunctionTool(calendar_tools.update_event)
+# delete_event_tool = FunctionTool(calendar_tools.delete_event)
+```
+
+### 7.2 統合実装例
+
+```python
+# src/agents/calendar_agent.py
+
+from openai_agents import Runner, Agent
+from ..tools.calendar_tools import (
+    add_event_tool, get_events_tool
+    # update_event_tool, delete_event_tool
+)
+
+class CalendarAgent:
+    """カレンダー管理エージェント"""
+    
+    def __init__(self):
+        # エージェントの定義
+        self.agent = Agent(
+            name="カレンダーアシスタント",
+            description="""
+            LINEを通じてGoogleカレンダーを管理するアシスタントです。
+            予定の追加、確認、更新、削除などの操作ができます。
+            日本語での自然な会話を理解し、適切に応答します。
+            """,
+            model="gpt-4o",
+            tools=[
+                add_event_tool,
+                get_events_tool,
+                # update_event_tool,
+                # delete_event_tool
+            ]
+        )
+        
+        # ランナーの初期化
+        self.runner = Runner()
+    
+    def process_message(self, message: str, user_id: str) -> str:
+        """
+        ユーザーからのメッセージを処理し、適切な応答を返す
+        
+        Args:
+            message: ユーザーからのメッセージ
+            user_id: LINE ユーザーID
+            
+        Returns:
+            応答メッセージ
+        """
+        try:
+            # コンテキストを作成（ユーザーIDなど）
+            context = {"user_id": user_id}
+            
+            # エージェントを実行
+            response = self.runner.run(
+                self.agent, 
+                message, 
+                context=context
+            )
+            
+            # 応答内容を返す
+            return response.content
+            
+        except Exception as e:
+            print(f"Error processing message: {str(e)}")
+            return "申し訳ありません。エラーが発生しました。しばらく経ってからもう一度お試しください。"
+```
+
+## 8. リソースとリファレンス
+
+- [OpenAI Agents SDK 公式ドキュメント](https://openai.github.io/openai-agents-python/)
+- [GitHub リポジトリ](https://github.com/openai/openai-agents-python)
+- [OpenAI API リファレンス](https://platform.openai.com/docs/api-reference)
+- [サンプルコード集](https://github.com/openai/openai-agents-python/tree/main/examples)
+
+## 9. まとめ
+
+OpenAI Agents SDKは、AIエージェントの開発を大幅に簡素化し、複雑なタスクへの対応を可能にする強力なツールです。このガイドに沿って実装することで、GoogleカレンダーとLINE連携プロジェクトの機能性と拡張性を大幅に向上させることができます。
+
+キーポイント：
+- シンプルな実装で高度な機能を実現
+- ツール定義によるモジュール化と再利用性の向上
+- トレース機能によるデバッグの容易さ
+- 自然言語処理の精度向上
+
+上記の実装ガイドとサンプルコードを参考に、段階的に移行を進めることで、プロジェクトの品質と機能性を向上させることができます。

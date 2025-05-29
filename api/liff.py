@@ -1,0 +1,101 @@
+"""
+Vercel LIFF endpoints
+"""
+import os
+import sys
+
+# Add src to path
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
+
+from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi.responses import RedirectResponse
+import logging
+import secrets
+import hashlib
+import base64
+
+from src.core.config import settings
+from src.services.auth_service import (
+    generate_google_auth_url,
+    exchange_code_for_tokens,
+    save_user_tokens
+)
+from src.repositories.user_repository import UserRepository
+
+app = FastAPI()
+logger = logging.getLogger(__name__)
+
+@app.get("/auth/google")
+async def start_google_auth(line_user_id: str = Query(...)):
+    """Start Google OAuth flow with PKCE"""
+    if not line_user_id:
+        raise HTTPException(status_code=400, detail="Missing LINE user ID")
+    
+    # Generate PKCE parameters
+    code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode('utf-8')).digest()
+    ).decode('utf-8').rstrip('=')
+    
+    # Generate state for CSRF protection
+    state = secrets.token_urlsafe(32)
+    
+    # Store PKCE verifier and LINE user ID with state
+    user_repo = UserRepository()
+    await user_repo.store_auth_state(state, {
+        'line_user_id': line_user_id,
+        'code_verifier': code_verifier
+    })
+    
+    # Generate auth URL
+    auth_url = generate_google_auth_url(state, code_challenge)
+    
+    return RedirectResponse(url=auth_url)
+
+@app.get("/status")
+async def get_user_status(line_user_id: str = Query(...)):
+    """Get user's connection status"""
+    if not line_user_id:
+        raise HTTPException(status_code=400, detail="Missing LINE user ID")
+    
+    user_repo = UserRepository()
+    user = await user_repo.get_user(line_user_id)
+    
+    return {
+        "linked": user is not None and user.get("google_email") is not None,
+        "email": user.get("google_email") if user else None
+    }
+
+@app.get("/settings")
+async def get_user_settings(line_user_id: str = Query(...)):
+    """Get user's settings and subscription info"""
+    if not line_user_id:
+        raise HTTPException(status_code=400, detail="Missing LINE user ID")
+    
+    user_repo = UserRepository()
+    user = await user_repo.get_user(line_user_id)
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    preferences = user.get("preferences", {})
+    
+    # Get subscription service info
+    from src.services.subscription_service import SubscriptionService
+    subscription_service = SubscriptionService()
+    subscription_info = await subscription_service.get_subscription_info(line_user_id)
+    
+    return {
+        "reminder_enabled": preferences.get("reminder_enabled", False),
+        "reminder_time_morning": preferences.get("reminder_time_morning", "09:00"),
+        "reminder_time_evening": preferences.get("reminder_time_evening", "21:00"),
+        "reminder_days_ahead": preferences.get("reminder_days_ahead", 1),
+        "use_ai_agent": preferences.get("use_ai_agent", False),
+        "subscription": subscription_info
+    }
+
+# Vercel handler
+def handler(request, response):
+    from mangum import Mangum
+    asgi_handler = Mangum(app)
+    return asgi_handler(request, response)
