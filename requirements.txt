@@ -1,32 +1,28 @@
-# Core Framework & Server
+# Core Framework (Vercel optimized)
 fastapi==0.104.1
-uvicorn[standard]==0.24.0
-python-multipart==0.0.6
+mangum==0.17.0
 
 # LINE Integration
 line-bot-sdk==3.5.1
 
-# Google Cloud Integration (Vercel compatible versions)
+# Google Cloud (minimal for Vercel)
 google-cloud-firestore==2.13.1
 google-api-python-client==2.108.0
 google-auth-oauthlib==1.1.0
-google-auth-httplib2==0.1.1
 google-auth==2.23.4
-google-oauth2-tool==0.0.3
+
+# Data validation
+pydantic==2.5.2
+pydantic-settings==2.1.0
 
 # Utilities
 python-dotenv==1.0.0
-pydantic==2.5.2
-pydantic-settings==2.1.0
 pytz==2023.3
 cryptography==41.0.7
 httpx==0.25.2
 
-# Logging
-python-json-logger==2.0.7
-
-# AI/ML
+# AI
 openai==1.54.3
 
-# Vercel adapter
-mangum==0.17.0
+# Logging
+python-json-logger==2.0.7
