@@ -1,24 +1,8 @@
 {
   "rewrites": [
     {
-      "source": "/webhook",
-      "destination": "/api/webhook"
-    },
-    {
-      "source": "/liff/(.*)",
-      "destination": "/api/liff"
-    },
-    {
-      "source": "/health",
-      "destination": "/api/health"
-    },
-    {
-      "source": "/auth/(.*)",
-      "destination": "/api/auth"
-    },
-    {
       "source": "/(.*)",
-      "destination": "/api/main"
+      "destination": "/api/index"
     }
   ]
 }
